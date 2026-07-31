@@ -71,16 +71,12 @@ set(COMMON_SOURCES
     src/common/local_storage.cpp
     src/common/local_metadata_store.cpp
     src/common/legacy_metadata_cleanup.cpp
-    src/common/cli.cpp
-    src/common/cloud_provider_base.cpp
-    src/common/sigv4.cpp
-    src/common/sha256_hmac.cpp
     src/common/autocloud_scan.cpp
-    src/common/steam_kv_injector.cpp
     src/common/parental_bypass.cpp
     src/common/metadata_sync.cpp
     src/common/stats_store.cpp
     src/common/stats_handlers.cpp
+    src/common/sha256_hmac.cpp
     src/common/miniz.c
     src/common/miniz_tdef.c
     src/common/miniz_tinfl.c
@@ -89,13 +85,22 @@ set(COMMON_SOURCES
 
 # ── Platform-specific sources ───────────────────────────────────────────
 
-set(PROVIDER_SOURCES
-    src/providers/google_drive.cpp
-    src/providers/onedrive.cpp
-    src/providers/local_disk_provider.cpp
-    src/providers/s3_provider.cpp
-    src/providers/r2_provider.cpp
-)
+set(PROVIDER_SOURCES src/providers/local_disk_provider.cpp)
+
+if(NOT APPLE)
+    list(APPEND COMMON_SOURCES
+        src/common/cli.cpp
+        src/common/cloud_provider_base.cpp
+        src/common/sigv4.cpp
+        src/common/steam_kv_injector.cpp
+    )
+    list(APPEND PROVIDER_SOURCES
+        src/providers/google_drive.cpp
+        src/providers/onedrive.cpp
+        src/providers/s3_provider.cpp
+        src/providers/r2_provider.cpp
+    )
+endif()
 
 if(WIN32)
     set(PLATFORM_SOURCES
@@ -110,6 +115,19 @@ if(WIN32)
         src/platform/win/http_transport_win.cpp
         src/platform/win/token_store_win.cpp
         src/platform/win/platform_win.cpp
+    )
+elseif(APPLE)
+    set(PLATFORM_SOURCES
+        src/platform/macos/cr_api.cpp
+        src/platform/macos/cloud_intercept.cpp
+        src/platform/macos/cloud_hooks.cpp
+        src/platform/macos/vtable_hook.cpp
+        src/platform/macos/log.cpp
+        src/platform/macos/steam_kv_injector_stub.cpp
+        src/platform/macos/http_server.cpp
+        src/platform/linux/http_util.cpp
+        src/platform/linux/platform_linux.cpp
+        src/platform/linux/file_util.cpp
     )
 else()
     set(PLATFORM_SOURCES
@@ -170,6 +188,27 @@ if(WIN32)
     # needs no Steamworks SDK headers/libs. steam_api64.dll must sit next to it.
     add_executable(cloud760_tool
         src/platform/win/cloud760_tool.cpp
+    )
+elseif(APPLE)
+    if(NOT CMAKE_OSX_ARCHITECTURES)
+        set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "macOS target architecture" FORCE)
+    endif()
+    if(NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+        message(FATAL_ERROR "CloudRedirect macOS currently supports ARM64 only")
+    endif()
+
+    target_include_directories(cloud_redirect PRIVATE
+        src/platform/macos
+        src/platform/linux
+    )
+    target_compile_definitions(cloud_redirect PRIVATE
+        CR_MACOS_FOLDER_ONLY=1
+        _FILE_OFFSET_BITS=64
+    )
+    target_link_libraries(cloud_redirect PRIVATE pthread)
+    set_target_properties(cloud_redirect PROPERTIES
+        SUFFIX ".dylib"
+        OSX_ARCHITECTURES arm64
     )
 else()
     target_include_directories(cloud_redirect PRIVATE src/platform/linux)

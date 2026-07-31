@@ -949,6 +949,8 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         std::string leaf;
         uint32_t prefixIdx;
         const LocalStorage::FileEntry* entry;
+        uint32_t rulePlatforms = 0;
+        bool hasRulePlatforms = false;
     };
     std::vector<PreparedFile> prepared;
 
@@ -962,6 +964,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         std::string cloudPath;  // rule path, normalized, no leading/trailing slash
         std::string pattern;    // * etc.
         bool recursive = false;
+        uint32_t platforms = 0xFFFFFFFFu;
     };
     std::string steamPath = CloudIntercept::GetSteamPath();
 
@@ -1008,16 +1011,25 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                 rr.cloudPath = p;
                 rr.pattern = r.pattern.empty() ? "*" : r.pattern;
                 rr.recursive = r.recursive;
+                rr.platforms = r.platforms;
                 ruleRoots.push_back(std::move(rr));
             }
         }
     }
 
+    struct FileRoot {
+        std::string token;
+        uint32_t platforms = 0;
+        bool fromRule = false;
+    };
+
     // Return the set of root tokens a file's cloud path belongs to, native-faithful.
+    // Preserve the platform mask per root: Windows and macOS rules may share the
+    // same cloud-relative filename while targeting different local directories.
     // Falls back to the file's recorded token (or default) when rules are
     // unavailable, preserving prior single-root behavior for non-collision apps.
-    auto rootsForFile = [&](const std::string& filename) -> std::vector<std::string> {
-        std::vector<std::string> out;
+    auto rootsForFile = [&](const std::string& filename) -> std::vector<FileRoot> {
+        std::vector<FileRoot> out;
         for (const auto& rr : ruleRoots) {
             // file must live under the rule's cloud path prefix
             std::string rel;
@@ -1040,8 +1052,14 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             const std::string& matchTarget =
                 rr.pattern.find('/') == std::string::npos ? leafName : rel;
             if (!AutoCloudUtil::WildcardMatchInsensitive(rr.pattern, matchTarget)) continue;
-            if (std::find(out.begin(), out.end(), rr.token) == out.end())
-                out.push_back(rr.token);
+            auto existing = std::find_if(out.begin(), out.end(), [&](const FileRoot& root) {
+                return root.token == rr.token;
+            });
+            if (existing == out.end()) {
+                out.push_back({rr.token, rr.platforms, true});
+            } else {
+                existing->platforms |= rr.platforms;
+            }
         }
         return out;
     };
@@ -1060,7 +1078,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
 
         // Determine the roots this file is served under. Prefer native-faithful
         // rule matching; fall back to recorded/default single token.
-        std::vector<std::string> fileRoots = rootsForFile(fe.filename);
+        std::vector<FileRoot> fileRoots = rootsForFile(fe.filename);
         if (fileRoots.empty()) {
             std::string fileToken;
             auto ftIt = fileTokenSnapshot.find(fe.filename);
@@ -1082,22 +1100,25 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                     fileToken = defaultToken;
                 }
             }
-            fileRoots.push_back(fileToken);
+            fileRoots.push_back({std::move(fileToken), 0, false});
         }
 
         // The recorded/primary token is used for the remotecache candidate (one
         // physical entry per file). Prefer it if present, else first root.
-        std::string primaryToken = fileRoots.front();
+        std::string primaryToken = fileRoots.front().token;
         {
             auto ftIt = fileTokenSnapshot.find(fe.filename);
             if (ftIt != fileTokenSnapshot.end() &&
-                std::find(fileRoots.begin(), fileRoots.end(), ftIt->second) != fileRoots.end())
+                std::find_if(fileRoots.begin(), fileRoots.end(), [&](const FileRoot& root) {
+                    return root.token == ftIt->second;
+                }) != fileRoots.end()) {
                 primaryToken = ftIt->second;
+            }
         }
 
         // Emit one wire entry per matching root (native mirrors this exactly).
-        for (const auto& fileToken : fileRoots) {
-            std::string fullPrefix = fileToken + dirPrefix;
+        for (const auto& fileRoot : fileRoots) {
+            std::string fullPrefix = fileRoot.token + dirPrefix;
             uint32_t prefixIdx;
             auto it = prefixMap.find(fullPrefix);
             if (it != prefixMap.end()) {
@@ -1107,9 +1128,11 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                 prefixMap[fullPrefix] = prefixIdx;
                 prefixList.push_back(fullPrefix);
             }
-            prepared.push_back({leaf, prefixIdx, &fe});
-            LOG("[NS-CL]   file: %s (prefix[%u]=%s, size=%llu, ts=%llu)%s",
+            prepared.push_back({leaf, prefixIdx, &fe,
+                                fileRoot.platforms, fileRoot.fromRule});
+            LOG("[NS-CL]   file: %s (prefix[%u]=%s, size=%llu, ts=%llu, platforms=0x%X source=%s)%s",
                 fe.filename.c_str(), prefixIdx, fullPrefix.c_str(), fe.rawSize, fe.timestamp,
+                fileRoot.platforms, fileRoot.fromRule ? "rule" : "history",
                 fileRoots.size() > 1 ? " [multi-root]" : "");
         }
 
@@ -1147,6 +1170,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             if (!pf.entry->deleted) persistState = cfeIt->second.persistState;
             platforms = cfeIt->second.platformsToSync;
         }
+        if (pf.hasRulePlatforms) platforms = pf.rulePlatforms;
         fileSub.WriteVarint(5, persistState);                    // persist_state
         fileSub.WriteVarint(6, platforms);                       // platforms_to_sync
         fileSub.WriteVarint(7, pf.prefixIdx);                    // path_prefix_index
@@ -1530,6 +1554,9 @@ RpcResult HandleBeginFileUpload(uint32_t appId, const std::vector<PB::Field>& re
 
     std::string urlPath = "/upload/" + std::to_string(accountId) + "/" + std::to_string(appId)
         + "/" + HttpUtil::UrlEncode(cleanName, true);
+#ifdef __APPLE__
+    urlPath = HttpServer::AddAuthToken(urlPath);
+#endif
 
     TryCaptureRootToken(accountId, appId, rootToken);
     BatchTracker_RecordFilePlatforms(accountId, appId, cleanName, platformsToSync);
@@ -2203,6 +2230,9 @@ RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBo
     }
     std::string urlPath = "/download/" + std::to_string(accountId) + "/" + std::to_string(appId)
         + "/" + HttpUtil::UrlEncode(cleanName, true);
+#ifdef __APPLE__
+    urlPath = HttpServer::AddAuthToken(urlPath);
+#endif
 
     uint64_t fileSize = 0;    uint64_t timestamp = 0;
     std::vector<uint8_t> sha;

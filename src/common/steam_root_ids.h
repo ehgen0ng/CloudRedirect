@@ -44,6 +44,29 @@ inline constexpr Entry kEntries[] = {
     {"LinuxXdgDataHome",      "%LinuxXdgDataHome%",     15},
     {"LinuxXdgConfigHome",    "%LinuxXdgConfigHome%",   16},
 };
+#elif defined(__APPLE__)
+// macOS remotecache.vdf uses the same root numbering observed on Windows.
+// Include Windows roots because macOS AutoCloud rules can map them to native
+// directories through platform-specific root overrides.
+inline constexpr Entry kEntries[] = {
+    {"GameInstall",           "%GameInstall%",           1},
+    {"WinMyDocuments",        "%WinMyDocuments%",        2},
+    {"WinAppDataLocal",       "%WinAppDataLocal%",       3},
+    {"WinAppDataRoaming",     "%WinAppDataRoaming%",     4},
+    {"SteamUserBaseStorage",  "%SteamUserBaseStorage%",   5},
+    {"MacHome",               "%MacHome%",                6},
+    {"MacAppSupport",         "%MacAppSupport%",          7},
+    {"MacDocuments",          "%MacDocuments%",           8},
+    {"WinSavedGames",         "%WinSavedGames%",         9},
+    {"WinProgramData",        "%WinProgramData%",        10},
+    {"SteamCloudDocuments",   "%SteamCloudDocuments%",   11},
+    {"WinAppDataLocalLow",    "%WinAppDataLocalLow%",   12},
+    {"MacCaches",             "%MacCaches%",             13},
+    {"LinuxHome",             "%LinuxHome%",             14},
+    {"LinuxXdgDataHome",      "%LinuxXdgDataHome%",     15},
+    {"LinuxXdgConfigHome",    "%LinuxXdgConfigHome%",   16},
+    {"WindowsHome",           "%WindowsHome%",           18},
+};
 #else
 // Linux IDs from steamclient.so (+1 vs Windows):
 //   0=Invalid, 1=Default, 2=GameInstall, 3=WinMyDocuments,

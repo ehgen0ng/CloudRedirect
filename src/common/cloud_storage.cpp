@@ -2,10 +2,12 @@
 #include "app_state.h"
 #include "local_storage.h"
 #include "local_disk_provider.h"
+#ifndef CR_MACOS_FOLDER_ONLY
 #include "google_drive_provider.h"
 #include "onedrive_provider.h"
 #include "s3_provider.h"
 #include "r2_provider.h"
+#endif
 #include "cloud_metadata_paths.h"
 #include "cloud_staging.h"
 #include "file_util.h"
@@ -3119,6 +3121,11 @@ std::unique_ptr<ICloudProvider> CreateCloudProvider(const std::string& name) {
     if (lower == "local" || lower == "folder") {
         return std::make_unique<LocalDiskProvider>();
     }
+#ifdef CR_MACOS_FOLDER_ONLY
+    LOG("[CloudStorage] CreateCloudProvider: provider '%s' is unavailable in the macOS folder-only build",
+        name.c_str());
+    return nullptr;
+#else
     // R2 and generic S3 use static access-key credentials with per-request
     // SigV4 signing, not OAuth token refresh, so they need no auth-failure
     // callback. R2 is the Cloudflare-specialized subclass of S3Provider.
@@ -3143,6 +3150,7 @@ std::unique_ptr<ICloudProvider> CreateCloudProvider(const std::string& name) {
     }
     LOG("[CloudStorage] CreateCloudProvider: unknown provider '%s'", name.c_str());
     return nullptr;
+#endif
 }
 
 std::string ResolveProviderTokenPath(const std::string& configDir,

@@ -15,6 +15,10 @@
 #include <unordered_set>
 #include <condition_variable>
 
+#ifdef __APPLE__
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace StatsStore {

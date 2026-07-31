@@ -199,6 +199,7 @@ enum class AutoCloudEffectivePlatform {
     Current,
     Windows,
     Linux,
+    MacOS,
 };
 
 // Sibling parsing
@@ -244,9 +245,12 @@ inline uint32_t ParseAutoCloudPlatformMask(const std::string& name) {
 
 inline bool AutoCloudRuleMatchesPlatform(uint32_t mask, AutoCloudEffectivePlatform platform) {
     if (platform == AutoCloudEffectivePlatform::Windows) return (mask & 1u) != 0;
+    if (platform == AutoCloudEffectivePlatform::MacOS) return (mask & 2u) != 0;
     if (platform == AutoCloudEffectivePlatform::Linux) return (mask & 8u) != 0;
 #ifdef _WIN32
     return (mask & 1u) != 0;  // Windows = bit 0
+#elif defined(__APPLE__)
+    return (mask & 2u) != 0;  // macOS = bit 1
 #else
     return (mask & 8u) != 0;  // Linux = bit 3
 #endif
@@ -330,7 +334,12 @@ inline bool IsLinuxOS(const std::string& osName) {
     return lower == "linux";
 }
 
-#ifndef _WIN32
+inline bool IsMacOS(const std::string& osName) {
+    std::string lower = ToLowerAscii(osName);
+    return lower == "macos" || lower == "osx" || lower == "mac";
+}
+
+#if !defined(_WIN32) && !defined(__APPLE__)
 // See autocloud_path_resolver.h for Linux path resolution.
 #include "autocloud_path_resolver.h"
 #endif
@@ -370,19 +379,30 @@ inline bool IsWindowsRootOverrideActive(const AutoCloudRootOverrideNative& overr
 }
 
 inline bool IsLinuxRootOverrideActive(const AutoCloudRootOverrideNative& overrideRule) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     return false;
 #else
     return IsLinuxOS(overrideRule.os);
 #endif
 }
 
+inline bool IsMacRootOverrideActive(const AutoCloudRootOverrideNative& overrideRule) {
+#ifdef __APPLE__
+    return IsMacOS(overrideRule.os);
+#else
+    return false;
+#endif
+}
+
 inline bool IsRootOverrideActiveForPlatform(const AutoCloudRootOverrideNative& overrideRule,
                                             AutoCloudEffectivePlatform platform) {
     if (platform == AutoCloudEffectivePlatform::Windows) return IsWindowsRootOverrideActive(overrideRule);
+    if (platform == AutoCloudEffectivePlatform::MacOS) return IsMacOS(overrideRule.os);
     if (platform == AutoCloudEffectivePlatform::Linux) return IsLinuxOS(overrideRule.os);
 #ifdef _WIN32
     return IsWindowsRootOverrideActive(overrideRule);
+#elif defined(__APPLE__)
+    return IsMacRootOverrideActive(overrideRule);
 #else
     return IsLinuxRootOverrideActive(overrideRule);
 #endif
@@ -415,7 +435,7 @@ inline void ApplyRootOverridesForPlatform(AutoCloudRuleNative& rule,
         return;
     }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     if (platform != AutoCloudEffectivePlatform::Windows) {
         std::string linuxRoot = AutoCloudPathResolver::WindowsRootToLinux(rule.root);
         if (!linuxRoot.empty()) {
