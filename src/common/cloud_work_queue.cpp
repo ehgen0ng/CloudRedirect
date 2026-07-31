@@ -703,7 +703,13 @@ void SetWorkerThreadCount(int count) {
 
 void Shutdown() {
     g_shuttingDown.store(true, std::memory_order_seq_cst);
-    g_workerRunning = false;
+    {
+        // Change the wait condition under the same mutex used by WorkerLoop.
+        // Otherwise shutdown can notify after a worker checks the flag but
+        // before it begins waiting, leaving join() blocked indefinitely.
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        g_workerRunning = false;
+    }
     g_queueCV.notify_all();
 
     // 5s bounded wait for workers; detach stragglers blocked on cloud I/O.

@@ -40,11 +40,31 @@ std::atomic<bool> g_initialized{false};
 std::atomic<bool> g_statsApiActive{false};
 CR_NotifyFn g_notify = nullptr;
 
+std::atomic<bool>& ShutdownComplete() {
+    // A host dylib may call CR_Shutdown after this dylib's static destructors.
+    // Keep the idempotence flag alive for the full process lifetime so that
+    // late calls return before touching destroyed mutexes or other state.
+    static auto* complete = new std::atomic<bool>(false);
+    return *complete;
+}
+
 std::mutex g_seedMutex;
 std::condition_variable g_seedCv;
 bool g_seedPending = false;
 bool g_seedStop = false;
 std::thread g_seedThread;
+
+struct ProcessExitGuard final {
+    ~ProcessExitGuard() { CR_Shutdown(); }
+};
+
+void EnsureProcessExitGuard() {
+    // The host lives in a different dylib, whose static exit guard can run
+    // after this dylib's globals. Register our guard after load-time statics so
+    // worker threads are stopped before their containers are destroyed.
+    static ProcessExitGuard guard;
+    (void)guard;
+}
 
 std::string ApplicationSupportRoot() {
     const char* home = std::getenv("HOME");
@@ -281,6 +301,7 @@ bool CR_InitCloudSave(const char* steamPath, CR_NotifyFn notify) {
 
     std::lock_guard lock(g_initMutex);
     if (g_initialized.load(std::memory_order_relaxed)) return true;
+    ShutdownComplete().store(false, std::memory_order_release);
     g_notify = notify;
 
     const std::string root = ApplicationSupportRoot();
@@ -328,6 +349,7 @@ bool CR_InitCloudSave(const char* steamPath, CR_NotifyFn notify) {
     }
 
     g_initialized.store(true, std::memory_order_release);
+    EnsureProcessExitGuard();
     StartSeedWorker();
     LOG("[macOS] CR_InitCloudSave complete: steam=%s sync=%s",
         CloudIntercept::GetSteamPath().c_str(), syncPath.c_str());
@@ -409,8 +431,14 @@ void CR_SetApps(const uint32_t* appIds, uint32_t count) {
 void CR_DrainPlaytimeUpdates() {}
 
 void CR_Shutdown() {
+    if (ShutdownComplete().load(std::memory_order_acquire)) return;
+
     std::lock_guard lock(g_initMutex);
-    if (!g_initialized.exchange(false, std::memory_order_acq_rel)) return;
+    if (ShutdownComplete().load(std::memory_order_relaxed)) return;
+    if (!g_initialized.exchange(false, std::memory_order_acq_rel)) {
+        ShutdownComplete().store(true, std::memory_order_release);
+        return;
+    }
     MacVtableHook::Uninstall();
     StopSeedWorker();
     HttpServer::Stop();
@@ -421,6 +449,7 @@ void CR_Shutdown() {
     Log::Shutdown();
     g_statsApiActive.store(false, std::memory_order_relaxed);
     g_notify = nullptr;
+    ShutdownComplete().store(true, std::memory_order_release);
 }
 
 bool CR_InstallVtableHooks() {
