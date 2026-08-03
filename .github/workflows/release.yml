@@ -1,0 +1,265 @@
+name: Build native plugins
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Package tag (defaults to Version.props)"
+        required: false
+        type: string
+      publish_release:
+        description: "Publish or update a GitHub Release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.notes.outputs.release_tag }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Prepare release metadata
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          manual_tag="${{ inputs.tag }}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          elif [ -n "$manual_tag" ]; then
+            tag="$manual_tag"
+          else
+            version="$(sed -n 's:.*<ReleaseVersion>\([^<]*\)</ReleaseVersion>.*:\1:p' Version.props | head -n1)"
+            prerelease="$(sed -n 's:.*<ReleasePrerelease>\([^<]*\)</ReleasePrerelease>.*:\1:p' Version.props | head -n1)"
+            if [ -z "$version" ]; then
+              echo "ReleaseVersion is missing from Version.props" >&2
+              exit 1
+            fi
+            tag="v${version}${prerelease}"
+          fi
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+
+          target_ref="$GITHUB_SHA"
+          if git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null; then
+            target_ref="$tag"
+          fi
+
+          previous_tag="$(git describe --tags --abbrev=0 "${target_ref}^" 2>/dev/null || true)"
+          if [ -n "$previous_tag" ]; then
+            range="${previous_tag}..${target_ref}"
+          else
+            range="$target_ref"
+          fi
+
+          git log "$range" \
+            --pretty=format:"- %s ([%h](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H))" \
+            > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            subject="$(git log -1 --pretty=%s "$target_ref")"
+            short_sha="$(git rev-parse --short "$target_ref")"
+            sha="$(git rev-parse "$target_ref")"
+            echo "- ${subject} ([${short_sha}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${sha}))" \
+              > release-notes.md
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 7
+
+  windows-x64:
+    name: Package Windows x64
+    runs-on: windows-2022
+    needs: prepare
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure MSVC build
+        run: cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64
+
+      - name: Build CloudRedirect DLL
+        run: cmake --build build-win --config Release --target cloud_redirect
+
+      - name: Create Windows package
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          $source = Join-Path $PWD "build-win\Release\cloud_redirect.dll"
+          if (-not (Test-Path -LiteralPath $source)) {
+            throw "Windows DLL was not produced at $source"
+          }
+
+          New-Item -ItemType Directory -Force -Path "artifact\cloud_redirect" | Out-Null
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $destination = Join-Path $PWD "artifact\cloud_redirect\cloud_redirect.dll"
+          Copy-Item -LiteralPath $source -Destination $destination -Force
+
+          $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  cloud_redirect.dll" |
+            Set-Content -LiteralPath "artifact\cloud_redirect\cloud_redirect.dll.sha256" -Encoding ascii
+
+          $zip = "release\cloud_redirect-$env:RELEASE_TAG-windows-x64.zip"
+          Compress-Archive -Path "artifact\cloud_redirect" -DestinationPath $zip -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: cloud-redirect-windows-x64
+          path: release/cloud_redirect-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-arm64:
+    name: Package macOS arm64
+    runs-on: macos-14
+    needs: prepare
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure arm64 build
+        run: >-
+          cmake -S . -B build-macos
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build CloudRedirect dylib
+        run: cmake --build build-macos --config Release --target cloud_redirect --parallel
+
+      - name: Create macOS package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          dylib="build-macos/cloud_redirect.dylib"
+          if [ ! -f "$dylib" ]; then
+            echo "macOS dylib was not produced at $dylib" >&2
+            exit 1
+          fi
+
+          archs="$(lipo -archs "$dylib")"
+          if [ "$archs" != "arm64" ]; then
+            echo "Unexpected macOS architectures: $archs" >&2
+            exit 1
+          fi
+
+          mkdir -p artifact/cloud_redirect release
+          cp "$dylib" artifact/cloud_redirect/cloud_redirect.dylib
+          (
+            cd artifact/cloud_redirect
+            shasum -a 256 cloud_redirect.dylib > cloud_redirect.dylib.sha256
+          )
+
+          zip_path="$PWD/release/cloud_redirect-${RELEASE_TAG}-macos-arm64.zip"
+          (
+            cd artifact
+            zip -qry -X "$zip_path" cloud_redirect
+          )
+
+          zip_list="$(unzip -l "$zip_path")"
+          if [[ "$zip_list" != *"cloud_redirect/cloud_redirect.dylib"* ]]; then
+            echo "cloud_redirect.dylib is missing from the macOS package" >&2
+            exit 1
+          fi
+          for forbidden_entry in "__MACOSX/" "/._"; do
+            if [[ "$zip_list" == *"$forbidden_entry"* ]]; then
+              echo "Unexpected macOS metadata entry: $forbidden_entry" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: cloud-redirect-macos-arm64
+          path: release/cloud_redirect-*-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    if: github.event_name == 'push' || inputs.publish_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs:
+      - prepare
+      - windows-x64
+      - macos-arm64
+
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@v7
+        with:
+          name: release-notes
+          path: release
+
+      - name: Download Windows package
+        uses: actions/download-artifact@v7
+        with:
+          name: cloud-redirect-windows-x64
+          path: release
+
+      - name: Download macOS package
+        uses: actions/download-artifact@v7
+        with:
+          name: cloud-redirect-macos-arm64
+          path: release
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          files=(
+            "release/cloud_redirect-${RELEASE_TAG}-windows-x64.zip"
+            "release/cloud_redirect-${RELEASE_TAG}-macos-arm64.zip"
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --notes-file release/release-notes.md
+          else
+            gh release create "$RELEASE_TAG" "${files[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --notes-file release/release-notes.md
+          fi
