@@ -4421,7 +4421,7 @@ void Init(const std::string& steamPath,
             } // !cloudSaveOnly (manifest pinning)
         } else {
             if (!cloudSaveOnly)
-                LOG("[ManifestPin] No pin config at %s", pinConfigPath.c_str());
+                LOG("[ManifestPin] No pin config at %s", g_configPath.c_str());
         }
     }
 
