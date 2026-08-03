@@ -12,8 +12,10 @@
 #include "log.h"
 #include "file_util.h"
 #include "http_server.h"
+#include "runtime_paths.h"
 
 #include <atomic>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -24,6 +26,27 @@ static std::atomic<bool> g_crInitDone{false};
 // Set when a third-party host signals it has stats hooks installed.
 static std::atomic<bool> g_statsApiActive{false};
 
+static void LogMigrationReport(const RuntimePaths::MigrationReport& report) {
+    for (const auto& record : report.records) {
+        const std::string source = FileUtil::PathToUtf8(record.source);
+        const std::string destination = FileUtil::PathToUtf8(record.destination);
+        if (record.error) {
+            LOG("[Migration] %s: %s -> %s (error=%d: %s; %s)",
+                RuntimePaths::ToString(record.outcome), source.c_str(),
+                destination.c_str(), record.error.value(),
+                record.error.message().c_str(), record.detail.c_str());
+        } else if (!record.detail.empty()) {
+            LOG("[Migration] %s: %s -> %s (%s)",
+                RuntimePaths::ToString(record.outcome), source.c_str(),
+                destination.c_str(), record.detail.c_str());
+        } else {
+            LOG("[Migration] %s: %s -> %s",
+                RuntimePaths::ToString(record.outcome), source.c_str(),
+                destination.c_str());
+        }
+    }
+}
+
 bool CR_InitCloudSave(const char* steamPath, CR_NotifyFn notify) {
     if (!steamPath) return false;
     if (g_crInitDone.load(std::memory_order_acquire)) return true;
@@ -33,17 +56,44 @@ bool CR_InitCloudSave(const char* steamPath, CR_NotifyFn notify) {
 
     try {
         std::string path(steamPath);
+        if (path.empty()) return false;
         if (!path.empty() && path.back() != '\\' && path.back() != '/')
             path += '\\';
 
-        std::string logPath = path + "cloud_redirect.log";
+        const std::filesystem::path steamRoot = FileUtil::Utf8ToPath(path);
+        if (steamRoot.empty()) {
+            OutputDebugStringA("CloudRedirect Steam path UTF-8 conversion failed");
+            return false;
+        }
+
+        RuntimePaths::Layout layout;
+        std::string layoutError;
+        if (!RuntimePaths::ResolveLayout(layout, layoutError)) {
+            const std::string message = "CloudRedirect path setup failed: " + layoutError;
+            OutputDebugStringA(message.c_str());
+            return false;
+        }
+        RuntimePaths::MigrationReport migration =
+            RuntimePaths::MigrateLegacySteamFiles(steamRoot, layout);
+
+        const std::string logPath = FileUtil::PathToUtf8(layout.logFile);
+        const std::string cloudRoot = FileUtil::PathToUtf8(layout.dataRoot);
+        const std::string configPath = FileUtil::PathToUtf8(layout.configFile);
+        if (logPath.empty() || cloudRoot.empty() || configPath.empty()) {
+            OutputDebugStringA("CloudRedirect path UTF-8 conversion failed");
+            return false;
+        }
         Log::Init(logPath.c_str());
 
         LOG("CloudRedirect loaded via CR_InitCloudSave (third-party client), PID=%u",
             GetCurrentProcessId());
         LOG("Steam path: %s", path.c_str());
+        LOG("Data root: %s", cloudRoot.c_str());
+        LOG("Config path: %s", configPath.c_str());
+        LogMigrationReport(migration);
 
-        CloudIntercept::Init(path, /*cloudSaveOnly=*/true, notify);
+        CloudIntercept::Init(path, cloudRoot, configPath,
+                             /*cloudSaveOnly=*/true, notify);
 
         g_crInitDone.store(true, std::memory_order_release);
         LOG("CR_InitCloudSave complete");

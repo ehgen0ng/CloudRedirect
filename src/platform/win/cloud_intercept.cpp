@@ -33,6 +33,7 @@
 #include <wincrypt.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <stdexcept>
 #include <atomic>
 #include <cstdarg>
 #include <cstddef>
@@ -357,6 +358,8 @@ static void RunAutoResolver() {
 }
 
 static std::string g_steamPath;
+static std::string g_cloudRoot;
+static std::string g_configPath;
 static std::string g_manifestEndpoint;
 static RecvPktFn g_originalRecvPkt = nullptr;       // trampoline to original RecvPkt (via inline detour)
 static uint8_t* g_recvPktDetourSite = nullptr;      // address of hooked RecvPkt prologue (for shutdown restore)
@@ -421,7 +424,7 @@ static std::atomic<uint64_t> g_detectedSteamVersion{0};
 static std::atomic<bool> g_cloudRedirectEnabled{true};
 
 // Manifest pinning (depot -> manifest override)
-// Config lives in Steam folder (per-system), NOT AppData (per-user).
+// Config is shared with the other CloudRedirect components in roaming AppData.
 static std::atomic<bool> g_manifestPinsEnabled{false};
 static std::atomic<bool> g_autoComment{true};  // when true, ignore lua setManifestid lines
 static std::atomic<bool> g_showNonSteamGame{true};  // show LUA games as "Playing non-Steam game" in friends
@@ -3260,7 +3263,7 @@ struct SyncState {
 };
 
 static std::string GetLuaSyncStatePath() {
-    return g_steamPath + "config\\stplug-in\\.sync_state";
+    return g_cloudRoot + "lua_sync_state";
 }
 
 [[maybe_unused]] static SyncState ReadSyncState() {
@@ -3286,7 +3289,7 @@ static void WriteSyncState(uint64_t syncTime, const std::unordered_set<std::stri
     std::string path = GetLuaSyncStatePath();
     std::error_code ec;
     std::filesystem::create_directories(FileUtil::Utf8ToPath(path).parent_path(), ec);
-    // Atomic-write to avoid a half-truncated .sync_state on crash.
+    // Atomic-write to avoid a half-truncated Lua sync state on crash.
     std::string content;
     content += std::to_string(syncTime);
     content += '\n';
@@ -3295,7 +3298,7 @@ static void WriteSyncState(uint64_t syncTime, const std::unordered_set<std::stri
         content += '\n';
     }
     if (!FileUtil::AtomicWriteText(path, content)) {
-        LOG("[LuaSync] Failed to write .sync_state");
+        LOG("[LuaSync] Failed to write Lua sync state");
     }
 }
 
@@ -4230,12 +4233,24 @@ static void TryAutoUpdateDll() {
     NotifyUser(CR_NOTIFY_INFO, "CloudRedirect -- DLL Updated", msg.c_str());
 }
 
-void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCallback) {
+void Init(const std::string& steamPath,
+          const std::string& cloudDataRoot,
+          const std::string& configPath,
+          bool cloudSaveOnly,
+          CR_NotifyFn notifyCallback) {
     g_notifyCallback = notifyCallback;
     g_cloudSaveOnly.store(cloudSaveOnly, std::memory_order_relaxed);
     g_steamPath = steamPath;
-    if (!g_steamPath.empty() && g_steamPath.back() != '\\')
+    if (!g_steamPath.empty() && g_steamPath.back() != '\\' &&
+        g_steamPath.back() != '/')
         g_steamPath += '\\';
+    g_cloudRoot = cloudDataRoot;
+    if (!g_cloudRoot.empty() && g_cloudRoot.back() != '\\' &&
+        g_cloudRoot.back() != '/')
+        g_cloudRoot += '\\';
+    g_configPath = configPath;
+    if (g_cloudRoot.empty() || g_configPath.empty())
+        throw std::runtime_error("CloudRedirect data/config path is empty");
 
     // Read Steam version for diagnostics and auto-update.
     uint64_t detectedVersion = ReadSteamVersion(g_steamPath);
@@ -4302,12 +4317,9 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
         LOG("[NS] No self-unlocking Lua files found (%d total luas) -- DLL will only log Cloud RPCs", totalLuas);
     }
 
-    // Steam-side config (per-system, controls DLL feature toggles).
-    // Read this early so we know whether to init cloud features.
-    std::string cloudRoot = g_steamPath + "cloud_redirect\\";
+    // Read unified per-user config early so we know whether to init cloud features.
     {
-        std::string pinConfigPath = cloudRoot + "config.json";
-        std::ifstream pinFile(FileUtil::Utf8ToPath(pinConfigPath));
+        std::ifstream pinFile(FileUtil::Utf8ToPath(g_configPath));
         if (pinFile) {
             std::string pinStr((std::istreambuf_iterator<char>(pinFile)), {});
             pinFile.close();
@@ -4421,49 +4433,6 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
         return;
     }
 
-    // migrate legacy blobs/ directory to storage/ (one-time, introduced build 6-7)
-    {
-        std::string oldRoot = g_steamPath + "cloud_redirect\\blobs\\";
-        std::string newRoot = g_steamPath + "cloud_redirect\\storage\\";
-        std::error_code ec;
-        auto oldRootPath = FileUtil::Utf8ToPath(oldRoot);
-        if (std::filesystem::is_directory(oldRootPath, ec)) {
-            int migrated = 0, skipped = 0;
-            std::string oldRootPrefix = FileUtil::MakePathPrefix(FileUtil::PathToUtf8(oldRootPath));
-            std::filesystem::recursive_directory_iterator it(oldRootPath, ec);
-            const std::filesystem::recursive_directory_iterator end;
-            while (!ec && it != end) {
-                const auto& entry = *it;
-                std::error_code regEc;
-                if (entry.is_regular_file(regEc)) {
-                    std::string entryUtf8 = FileUtil::PathToUtf8(entry.path());
-                    FileUtil::NormalizeSlashesInPlace(entryUtf8);
-                    std::string relStr;
-                    if (FileUtil::RelativeUtf8Path(entryUtf8, oldRootPrefix, &relStr)) {
-                        auto dest = FileUtil::Utf8ToPath(newRoot) / FileUtil::Utf8ToPath(relStr);
-                        std::error_code existsEc;
-                        if (std::filesystem::exists(dest, existsEc)) {
-                            skipped++;
-                        } else {
-                            std::error_code mkEc;
-                            std::filesystem::create_directories(dest.parent_path(), mkEc);
-                            std::error_code mvEc;
-                            std::filesystem::rename(entry.path(), dest, mvEc);
-                            if (!mvEc) migrated++;
-                        }
-                    }
-                }
-                std::error_code stepEc;
-                it.increment(stepEc);
-                if (stepEc) break;
-            }
-            std::error_code rmEc;
-            std::filesystem::remove_all(oldRootPath, rmEc);
-            if (migrated > 0 || skipped > 0)
-                LOG("[NS] Migrated legacy blobs/ -> storage/: %d files moved, %d already existed (skipped)", migrated, skipped);
-        }
-    }
-
     // Scrub Playtime.bin/UserGameStats.bin relics left by older DLL builds
     // in Steam's userdata remote/. Current DLL never writes there.
     LegacyMetadataCleanup::PruneSteamUserdata(g_steamPath);
@@ -4549,7 +4518,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     }
 
     // start local HTTP server for upload/download
-    std::string blobRoot = g_steamPath + "cloud_redirect\\storage\\";
+    std::string blobRoot = g_cloudRoot + "storage\\";
     if (HttpServer::Start(blobRoot)) {
         LOG("[NS] HTTP server started on port %u, blob root: %s",
             HttpServer::GetPort(), blobRoot.c_str());
@@ -4558,7 +4527,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     }
 
     // init local storage for metadata tracking
-    std::string storageRoot = g_steamPath + "cloud_redirect\\storage\\";
+    std::string storageRoot = g_cloudRoot + "storage\\";
     LocalStorage::Init(storageRoot);
     LocalMetadataStore::Init(storageRoot);
     PendingOpsJournal::Init(storageRoot);
@@ -4566,25 +4535,10 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     // init CloudStorage manager - read config to determine cloud provider
     std::unique_ptr<ICloudProvider> provider;
 
-    // Config lives in %AppData%/CloudRedirect/config.json (per-user)
-    std::string configPath;
-    {
-        // Wide-API: SHGetFolderPathA mangles non-ASCII usernames, falling back to
-        // local-only mode even when a cloud provider is configured.
-        PWSTR wideAppData = nullptr;
-        HRESULT hr = SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, nullptr, &wideAppData);
-        if (SUCCEEDED(hr) && wideAppData) {
-            configPath = FileUtil::WideToUtf8(wideAppData) + "\\CloudRedirect\\config.json";
-            CoTaskMemFree(wideAppData);
-        } else {
-            if (wideAppData) CoTaskMemFree(wideAppData);
-            configPath = cloudRoot + "config.json";
-            LOG("[NS] WARNING: Could not resolve %%APPDATA%%, falling back to steam folder for config");
-        }
-    }
+    // Config lives in %APPDATA%\CloudRedirect\config.json (resolved by caller).
     // Read manifest endpoint from settings.json (same directory as config.json).
     {
-        std::string settingsDir = configPath.substr(0, configPath.rfind('\\') + 1);
+        std::string settingsDir = g_configPath.substr(0, g_configPath.rfind('\\') + 1);
         std::string settingsPath = settingsDir + "settings.json";
         std::ifstream sf(FileUtil::Utf8ToPath(settingsPath));
         if (sf) {
@@ -4598,7 +4552,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
         }
     }
 
-    std::ifstream configFile(FileUtil::Utf8ToPath(configPath));
+    std::ifstream configFile(FileUtil::Utf8ToPath(g_configPath));
     if (configFile) {
         std::string configStr((std::istreambuf_iterator<char>(configFile)), {});
         configFile.close();
@@ -4713,10 +4667,10 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             LOG("[NS] DLL auto-update enabled, checking in background");
         }
     } else {
-        LOG("[NS] No config.json at %s -- local-only mode", configPath.c_str());
+        LOG("[NS] No config.json at %s -- local-only mode", g_configPath.c_str());
     }
 
-    CloudStorage::Init(cloudRoot, std::move(provider));
+    CloudStorage::Init(g_cloudRoot, std::move(provider));
     g_startupMetadataScheduled.store(false);
 
     // Native stats / playtime store (cloud-backed). Must come after CloudStorage.
@@ -4829,7 +4783,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     StatsStore::SetSchemaMissingCallback([](uint32_t appId) {
         std::thread([appId] { RequestSchemaForApp(appId, true); }).detach();
     });
-    StatsStore::Init(cloudRoot, g_steamPath);
+    StatsStore::Init(g_cloudRoot, g_steamPath);
     StatsHandlers::Init();
     // Seed on bg thread only if a stats feature is enabled (blocks on cloud reads).
     // Third-party: check raw config flags since StGateOpen() is false.
@@ -5680,7 +5634,7 @@ static uint64_t NowEpochSecs() {
 }
 
 static std::string SchemaSkipPath() {
-    return g_steamPath + "cloud_redirect\\cr_schema_skip.txt";
+    return g_cloudRoot + "cr_schema_skip.txt";
 }
 
 // Rewrite skip file from in-memory map. Caller must hold g_schemaSkipMutex.
@@ -5689,7 +5643,8 @@ static void RewriteSchemaSkipFileLocked() {
     out.reserve(g_schemaSkip.size() * 20);
     for (const auto& kv : g_schemaSkip)
         out += std::to_string(kv.first) + "," + std::to_string(kv.second) + "\r\n";
-    HANDLE h = CreateFileA(SchemaSkipPath().c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+    const auto path = FileUtil::LongPath(FileUtil::Utf8ToPath(SchemaSkipPath()));
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     DWORD w = 0;
@@ -5699,7 +5654,8 @@ static void RewriteSchemaSkipFileLocked() {
 
 static void LoadSchemaSkipList() {
     if (g_schemaSkipLoaded.exchange(true)) return;
-    HANDLE h = CreateFileA(SchemaSkipPath().c_str(), GENERIC_READ, FILE_SHARE_READ,
+    const auto path = FileUtil::LongPath(FileUtil::Utf8ToPath(SchemaSkipPath()));
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     std::string buf;
@@ -5754,7 +5710,8 @@ static void AddSchemaSkip(uint32_t appId) {
         std::lock_guard<std::mutex> lock(g_schemaSkipMutex);
         g_schemaSkip[appId] = now;
     }
-    HANDLE h = CreateFileA(SchemaSkipPath().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+    const auto path = FileUtil::LongPath(FileUtil::Utf8ToPath(SchemaSkipPath()));
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     SetFilePointer(h, 0, nullptr, FILE_END);

@@ -23,7 +23,10 @@ struct CNetPacket {
 // RecvPkt takes only 2 params: (thisptr, CNetPacket*)
 using RecvPktFn = int64_t(__fastcall*)(void* thisptr, CNetPacket* pkt);
 
-void Init(const std::string& steamPath, bool cloudSaveOnly = false,
+void Init(const std::string& steamPath,
+          const std::string& cloudDataRoot,
+          const std::string& configPath,
+          bool cloudSaveOnly = false,
           CR_NotifyFn notifyCallback = nullptr);
 
 // Inline-detour CCMConnection::RecvPkt in steamclient64.dll via sig-scan.

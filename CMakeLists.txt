@@ -106,6 +106,7 @@ if(WIN32)
     set(PLATFORM_SOURCES
         src/platform/win/dllmain.cpp
         src/platform/win/cr_api.cpp
+        src/platform/win/runtime_paths.cpp
         src/platform/win/cloud_intercept.cpp
         src/platform/win/sig_scanner.cpp
         src/platform/win/sc_resolver.cpp
